@@ -14,7 +14,10 @@ from TechVJ.strings import HELP_TXT
 from bot import TechVJUser
 
 class batch_temp(object):
-    IS_BATCH = {}
+    # One queue per user. A user's links are processed automatically in order.
+    QUEUES = {}
+    WORKERS = {}
+    CANCEL_EVENTS = {}
 
 async def downstatus(client, statusfile, message, chat):
     while True:
@@ -87,12 +90,269 @@ async def send_help(client: Client, message: Message):
 
 # cancel command
 @Client.on_message(filters.command(["cancel"]))
-async def send_cancel(client: Client, message: Message):
-    batch_temp.IS_BATCH[message.from_user.id] = True
-    await client.send_message(
-        chat_id=message.chat.id, 
-        text="**Batch Successfully Cancelled.**"
-    )
+async def send_cancel(client, message: Message):
+    user_id = message.from_user.id
+    cancel_event = batch_temp.CANCEL_EVENTS.get(user_id)
+
+    if cancel_event:
+        cancel_event.set()
+
+    queue = batch_temp.QUEUES.get(user_id)
+    cleared = 0
+    if queue:
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+                cleared += 1
+            except asyncio.QueueEmpty:
+                break
+
+    if cancel_event or cleared:
+        await client.send_message(
+            message.chat.id,
+            f"**Current task will be cancelled and {cleared} queued link(s) removed.**"
+        )
+    else:
+        await client.send_message(
+            message.chat.id,
+            "**No active or queued task found.**"
+        )
+
+
+async def process_link(client: Client, message: Message, cancel_event: asyncio.Event):
+    datas = message.text.split("/")
+    temp = datas[-1].replace("?single", "").split("-")
+
+    try:
+        fromID = int(temp[0].strip())
+        try:
+            toID = int(temp[1].strip())
+        except:
+            toID = fromID
+    except (ValueError, IndexError):
+        await message.reply_text("**Invalid Telegram link.**")
+        return
+
+    if LOGIN_SYSTEM == True:
+        user_data = await db.get_session(message.from_user.id)
+        if user_data is None:
+            await message.reply(
+                "**For Downloading Restricted Content You Have To /login First.**"
+            )
+            return
+
+        api_id = int(await db.get_api_id(message.from_user.id))
+        api_hash = await db.get_api_hash(message.from_user.id)
+
+        try:
+            acc = Client(
+                "saverestricted",
+                session_string=user_data,
+                api_hash=api_hash,
+                api_id=api_id
+            )
+            await acc.connect()
+        except:
+            await message.reply(
+                "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
+            )
+            return
+    else:
+        if TechVJUser is None:
+            await client.send_message(
+                message.chat.id,
+                "**String Session is not Set**",
+                reply_to_message_id=message.id
+            )
+            return
+        acc = TechVJUser
+
+    try:
+        for msgid in range(fromID, toID + 1):
+            if cancel_event.is_set():
+                break
+
+            # private
+            if "https://t.me/c/" in message.text:
+                chatid = int("-100" + datas[4])
+                try:
+                    await handle_private(client, acc, message, chatid, msgid, cancel_event)
+                except Exception as e:
+                    if ERROR_MESSAGE == True:
+                        await client.send_message(
+                            message.chat.id,
+                            f"Error: {e}",
+                            reply_to_message_id=message.id
+                        )
+
+            # bot
+            elif "https://t.me/b/" in message.text:
+                username = datas[4]
+                try:
+                    await handle_private(client, acc, message, username, msgid, cancel_event)
+                except Exception as e:
+                    if ERROR_MESSAGE == True:
+                        await client.send_message(
+                            message.chat.id,
+                            f"Error: {e}",
+                            reply_to_message_id=message.id
+                        )
+
+            # public
+            else:
+                username = datas[3]
+
+                try:
+                    msg = await client.get_messages(username, msgid)
+                except UsernameNotOccupied:
+                    await client.send_message(
+                        message.chat.id,
+                        "The username is not occupied by anyone",
+                        reply_to_message_id=message.id
+                    )
+                    return
+
+                try:
+                    await client.copy_message(
+                        message.chat.id,
+                        msg.chat.id,
+                        msg.id,
+                        reply_to_message_id=message.id
+                    )
+                except:
+                    try:
+                        await handle_private(
+                            client, acc, message, username, msgid, cancel_event
+                        )
+                    except Exception as e:
+                        if ERROR_MESSAGE == True:
+                            await client.send_message(
+                                message.chat.id,
+                                f"Error: {e}",
+                                reply_to_message_id=message.id
+                            )
+
+            if cancel_event.is_set():
+                break
+
+            # Keep the existing flood-wait protection between messages.
+            await asyncio.sleep(WAITING_TIME)
+
+    finally:
+        if LOGIN_SYSTEM == True:
+            try:
+                await acc.disconnect()
+            except:
+                pass
+
+
+async def queue_worker(user_id):
+    queue = batch_temp.QUEUES[user_id]
+    cancel_event = batch_temp.CANCEL_EVENTS[user_id]
+
+    try:
+        while not queue.empty():
+            try:
+                client, message = await queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                cancel_event.clear()
+                position_text = "Processing your queued link..."
+                await message.reply_text(position_text)
+                await process_link(client, message, cancel_event)
+            except Exception as e:
+                if ERROR_MESSAGE == True:
+                    try:
+                        await message.reply_text(f"Error: {e}")
+                    except:
+                        pass
+            finally:
+                queue.task_done()
+
+                # Cancellation applies to the current batch and clears waiting items.
+                if cancel_event.is_set():
+                    while not queue.empty():
+                        try:
+                            queue.get_nowait()
+                            queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    break
+    finally:
+        batch_temp.WORKERS.pop(user_id, None)
+        batch_temp.CANCEL_EVENTS.pop(user_id, None)
+        if queue.empty():
+            batch_temp.QUEUES.pop(user_id, None)
+
+
+@Client.on_message(filters.text & filters.private)
+async def save(client: Client, message: Message):
+    # Joining chat
+    if ("https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text) and LOGIN_SYSTEM == False:
+        if TechVJUser is None:
+            await client.send_message(
+                message.chat.id,
+                "String Session is not Set",
+                reply_to_message_id=message.id
+            )
+            return
+
+        try:
+            try:
+                await TechVJUser.join_chat(message.text)
+            except Exception as e:
+                await client.send_message(
+                    message.chat.id,
+                    f"Error : {e}",
+                    reply_to_message_id=message.id
+                )
+                return
+            await client.send_message(
+                message.chat.id,
+                "Chat Joined",
+                reply_to_message_id=message.id
+            )
+        except UserAlreadyParticipant:
+            await client.send_message(
+                message.chat.id,
+                "Chat already Joined",
+                reply_to_message_id=message.id
+            )
+        except InviteHashExpired:
+            await client.send_message(
+                message.chat.id,
+                "Invalid Link",
+                reply_to_message_id=message.id
+            )
+        return
+
+    if "https://t.me/" not in message.text:
+        return
+
+    user_id = message.from_user.id
+
+    # Queue every new link instead of rejecting it while another task is running.
+    queue = batch_temp.QUEUES.setdefault(user_id, asyncio.Queue())
+    cancel_event = batch_temp.CANCEL_EVENTS.setdefault(user_id, asyncio.Event())
+
+    await queue.put((client, message))
+    position = queue.qsize()
+
+    if position == 1 and user_id not in batch_temp.WORKERS:
+        await message.reply_text("**Link added. Processing now...**")
+    else:
+        await message.reply_text(
+            f"**Link added to queue. Position: {position}**\n"
+            "It will start automatically after the previous task finishes."
+        )
+
+    if user_id not in batch_temp.WORKERS:
+        worker = asyncio.create_task(queue_worker(user_id))
+        batch_temp.WORKERS[user_id] = worker
+
 
 @Client.on_message(filters.text & filters.private)
 async def save(client: Client, message: Message):
@@ -194,7 +454,7 @@ async def save(client: Client, message: Message):
 
 
 # handle private
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, cancel_event=None):
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty: return 
     msg_type = get_message_type(msg)
@@ -206,7 +466,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             chat = message.chat.id
     else:
         chat = message.chat.id
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    if cancel_event and cancel_event.is_set(): return 
     if "Text" == msg_type:
         try:
             await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
