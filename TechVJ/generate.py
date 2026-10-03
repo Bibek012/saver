@@ -7,6 +7,7 @@ from io import BytesIO
 import qrcode
 from pyrogram import Client, filters, raw
 from pyrogram.errors import RPCError
+from pyrogram.session import Auth, Session
 from pyrogram.types import InputMediaPhoto, Message
 
 from config import API_ID, API_HASH
@@ -56,6 +57,47 @@ async def refresh_qr(qr_message: Message, token: bytes):
     )
 
 
+async def import_login_token_on_dc(client: Client, dc_id: int, token: bytes):
+    """
+    Telegram may return auth.LoginTokenMigrateTo after the QR is scanned.
+    In that case the token must be imported on the requested DC.
+    """
+    test_mode = await client.storage.test_mode()
+
+    if client.session is not None:
+        await client.session.stop()
+
+    auth_key = await Auth(client, dc_id, test_mode).create()
+
+    client.session = Session(
+        client,
+        dc_id,
+        auth_key,
+        test_mode
+    )
+
+    await client.session.start()
+
+    # Keep Pyrogram's in-memory storage in sync with the new DC/session.
+    await client.storage.dc_id(dc_id)
+    await client.storage.auth_key(auth_key)
+
+    return await client.invoke(
+        raw.functions.auth.ImportLoginToken(token=token)
+    )
+
+
+async def handle_login_token_migrate(client: Client, result):
+    if not isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        return result
+
+    return await import_login_token_on_dc(
+        client,
+        result.dc_id,
+        result.token
+    )
+
+
 async def qr_login(client: Client, message: Message, api_id: int, api_hash: str):
     result = await client.invoke(
         raw.functions.auth.ExportLoginToken(
@@ -65,18 +107,18 @@ async def qr_login(client: Client, message: Message, api_id: int, api_hash: str)
         )
     )
 
+    if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        result = await handle_login_token_migrate(client, result)
+
     if isinstance(result, raw.types.auth.LoginTokenSuccess):
+        await client.storage.user_id(result.authorization.user.id)
+        await client.storage.is_bot(False)
         return True
 
-    if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-        await message.reply(
-            "**Telegram requested another DC for this login.**\n"
-            "Please run /login again."
-        )
-        return False
-
     if not isinstance(result, raw.types.auth.LoginToken):
-        raise RuntimeError(f"Unexpected Telegram QR response: {type(result).__name__}")
+        raise RuntimeError(
+            f"Unexpected Telegram QR response: {type(result).__name__}"
+        )
 
     qr_message = await send_qr(message, result.token, qr_caption(True))
     deadline = time.monotonic() + QR_TIMEOUT
@@ -85,7 +127,6 @@ async def qr_login(client: Client, message: Message, api_id: int, api_hash: str)
     while time.monotonic() < deadline:
         await asyncio.sleep(2)
 
-        # Check whether Telegram has completed the QR login.
         result = await client.invoke(
             raw.functions.auth.ExportLoginToken(
                 api_id=api_id,
@@ -95,14 +136,22 @@ async def qr_login(client: Client, message: Message, api_id: int, api_hash: str)
         )
 
         if isinstance(result, raw.types.auth.LoginTokenSuccess):
+            await client.storage.user_id(result.authorization.user.id)
+            await client.storage.is_bot(False)
             return True
 
         if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-            await message.reply(
-                "**Telegram requested another DC for this login.**\n"
-                "Please run /login again."
-            )
-            return False
+            result = await handle_login_token_migrate(client, result)
+
+            if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                await client.storage.user_id(result.authorization.user.id)
+                await client.storage.is_bot(False)
+                return True
+
+            if not isinstance(result, raw.types.auth.LoginToken):
+                raise RuntimeError(
+                    f"Unexpected Telegram QR migration response: {type(result).__name__}"
+                )
 
         # Do not send a new message every 2 seconds.
         # Refresh the existing QR only when the previous token is close to expiry.
