@@ -7,12 +7,13 @@ from io import BytesIO
 import qrcode
 from pyrogram import Client, filters, raw
 from pyrogram.errors import RPCError
-from pyrogram.types import Message
+from pyrogram.types import InputMediaPhoto, Message
 
 from config import API_ID, API_HASH
 from database.db import db
 
 QR_TIMEOUT = 300
+QR_REFRESH_INTERVAL = 25
 
 
 def make_qr(token: bytes) -> BytesIO:
@@ -28,8 +29,31 @@ def make_qr(token: bytes) -> BytesIO:
     return image
 
 
+def qr_caption(first=False):
+    if first:
+        return (
+            "**Scan this QR with Telegram.**\n\n"
+            "Telegram → Settings → Devices → Link Desktop Device\n"
+            "Then scan the QR code above.\n\n"
+            "No OTP is required."
+        )
+    return (
+        "**QR refreshed. Please scan the latest QR.**\n\n"
+        "Telegram → Settings → Devices → Link Desktop Device"
+    )
+
+
 async def send_qr(message: Message, token: bytes, caption: str):
-    await message.reply_photo(photo=make_qr(token), caption=caption)
+    return await message.reply_photo(photo=make_qr(token), caption=caption)
+
+
+async def refresh_qr(qr_message: Message, token: bytes):
+    await qr_message.edit_media(
+        InputMediaPhoto(
+            media=make_qr(token),
+            caption=qr_caption(False)
+        )
+    )
 
 
 async def qr_login(client: Client, message: Message, api_id: int, api_hash: str):
@@ -45,26 +69,23 @@ async def qr_login(client: Client, message: Message, api_id: int, api_hash: str)
         return True
 
     if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-        await message.reply("**Telegram requested another DC for this login.**\nPlease run /login again.")
+        await message.reply(
+            "**Telegram requested another DC for this login.**\n"
+            "Please run /login again."
+        )
         return False
 
     if not isinstance(result, raw.types.auth.LoginToken):
         raise RuntimeError(f"Unexpected Telegram QR response: {type(result).__name__}")
 
-    await send_qr(
-        message,
-        result.token,
-        "**Scan this QR with Telegram.**\n\n"
-        "Telegram → Settings → Devices → Link Desktop Device\n"
-        "Then scan the QR code above.\n\n"
-        "No OTP is required."
-    )
-
+    qr_message = await send_qr(message, result.token, qr_caption(True))
     deadline = time.monotonic() + QR_TIMEOUT
+    next_refresh = time.monotonic() + QR_REFRESH_INTERVAL
 
     while time.monotonic() < deadline:
         await asyncio.sleep(2)
 
+        # Check whether Telegram has completed the QR login.
         result = await client.invoke(
             raw.functions.auth.ExportLoginToken(
                 api_id=api_id,
@@ -77,11 +98,20 @@ async def qr_login(client: Client, message: Message, api_id: int, api_hash: str)
             return True
 
         if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-            await message.reply("**Telegram requested another DC for this login.**\nPlease run /login again.")
+            await message.reply(
+                "**Telegram requested another DC for this login.**\n"
+                "Please run /login again."
+            )
             return False
 
-        if isinstance(result, raw.types.auth.LoginToken):
-            await send_qr(message, result.token, "**QR refreshed. Please scan this new QR.**")
+        # Do not send a new message every 2 seconds.
+        # Refresh the existing QR only when the previous token is close to expiry.
+        if (
+            isinstance(result, raw.types.auth.LoginToken)
+            and time.monotonic() >= next_refresh
+        ):
+            await refresh_qr(qr_message, result.token)
+            next_refresh = time.monotonic() + QR_REFRESH_INTERVAL
 
     await message.reply("**QR login timed out. Run /login again.**")
     return False
@@ -100,7 +130,9 @@ async def main(bot: Client, message: Message):
     user_id = int(message.from_user.id)
 
     if await db.get_session(user_id) is not None:
-        await message.reply("**You Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
+        await message.reply(
+            "**You Are Already Logged In. First /logout Your Old Session. Then Do Login.**"
+        )
         return
 
     await message.reply(
