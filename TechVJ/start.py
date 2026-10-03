@@ -354,119 +354,60 @@ async def save(client: Client, message: Message):
         batch_temp.WORKERS[user_id] = worker
 
 
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, cancel_event=None):
-    msg: Message = await acc.get_messages(chatid, msgid)
-    if msg.empty: return 
-    msg_type = get_message_type(msg)
-    if not msg_type: return 
+async def handle_private(client, acc, message: Message, chatid, msgid: int, cancel_event=None):
+    """
+    Copy the message directly on Telegram's servers.
+
+    The media is NOT downloaded to the Render server and re-uploaded.
+    The logged-in user account must have access to the source chat and
+    permission to post/copy into CHANNEL_ID.
+    """
+    if cancel_event and cancel_event.is_set():
+        return
+
     if CHANNEL_ID:
         try:
-            chat = int(CHANNEL_ID)
+            destination = int(CHANNEL_ID)
         except:
-            chat = message.chat.id
+            destination = message.chat.id
     else:
-        chat = message.chat.id
-    if cancel_event and cancel_event.is_set(): return 
-    if "Text" == msg_type:
-        try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
+        destination = message.chat.id
 
-    smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
-    asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+    status = None
+    if destination != message.chat.id:
+        try:
+            status = await client.send_message(
+                message.chat.id,
+                "**Copying directly to your channel...**",
+                reply_to_message_id=message.id
+            )
+        except:
+            status = None
+
     try:
-        file = await acc.download_media(msg, progress=progress, progress_args=[message,"down"])
-        os.remove(f'{message.id}downstatus.txt')
+        # Telegram performs the copy server-side. No media file is downloaded
+        # to the bot/Render server.
+        await acc.copy_message(
+            chat_id=destination,
+            from_chat_id=chatid,
+            message_id=msgid
+        )
+
     except Exception as e:
         if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
-        return await smsg.delete()
-    if cancel_event and cancel_event.is_set(): return 
-    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
+            await client.send_message(
+                message.chat.id,
+                f"**Telegram copy failed:** {e}",
+                reply_to_message_id=message.id
+            )
+        return
 
-    if msg.caption:
-        caption = msg.caption
-    else:
-        caption = None
-    if cancel_event and cancel_event.is_set(): return 
-            
-    if "Document" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-        
-
-    elif "Video" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-        except:
-            ph_path = None
-        
-        try:
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-
-    elif "Animation" == msg_type:
-        try:
-            await client.send_animation(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
-    elif "Sticker" == msg_type:
-        try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)     
-
-    elif "Voice" == msg_type:
-        try:
-            await client.send_voice(chat, file, caption=caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-
-    elif "Audio" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-        except:
-            ph_path = None
-
-        try:
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])   
-        except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
-        if ph_path != None: os.remove(ph_path)
-
-    elif "Photo" == msg_type:
-        try:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-    
-    if os.path.exists(f'{message.id}upstatus.txt'): 
-        os.remove(f'{message.id}upstatus.txt')
-        os.remove(file)
-    await client.delete_messages(message.chat.id,[smsg.id])
+    finally:
+        if status:
+            try:
+                await status.delete()
+            except:
+                pass
 
 
 # get the type of message
