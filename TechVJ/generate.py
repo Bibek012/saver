@@ -1,109 +1,193 @@
 # Don't Remove Credit Tg - @VJ_Bots
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
+import asyncio
+import base64
+import time
+from io import BytesIO
 
-import traceback
+import qrcode
+from pyrogram import Client, filters, raw
+from pyrogram.errors import RPCError
 from pyrogram.types import Message
-from pyrogram import Client, filters
-from asyncio.exceptions import TimeoutError
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import (
-    ApiIdInvalid,
-    PhoneNumberInvalid,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    SessionPasswordNeeded,
-    PasswordHashInvalid
-)
+
 from config import API_ID, API_HASH
 from database.db import db
 
-SESSION_STRING_SIZE = 351
+QR_TIMEOUT = 300
+
+
+def make_qr(token: bytes) -> BytesIO:
+    encoded = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(f"tg://login?token={encoded}")
+    qr.make(fit=True)
+
+    image = BytesIO()
+    image.name = "telegram_login_qr.png"
+    qr.make_image().save(image, format="PNG")
+    image.seek(0)
+    return image
+
+
+async def send_qr(message: Message, token: bytes, caption: str):
+    await message.reply_photo(photo=make_qr(token), caption=caption)
+
+
+async def qr_login(client: Client, message: Message, api_id: int, api_hash: str):
+    result = await client.invoke(
+        raw.functions.auth.ExportLoginToken(
+            api_id=api_id,
+            api_hash=api_hash,
+            except_ids=[]
+        )
+    )
+
+    if isinstance(result, raw.types.auth.LoginTokenSuccess):
+        return True
+
+    if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        await message.reply("**Telegram requested another DC for this login.**\nPlease run /login again.")
+        return False
+
+    if not isinstance(result, raw.types.auth.LoginToken):
+        raise RuntimeError(f"Unexpected Telegram QR response: {type(result).__name__}")
+
+    await send_qr(
+        message,
+        result.token,
+        "**Scan this QR with Telegram.**\n\n"
+        "Telegram → Settings → Devices → Link Desktop Device\n"
+        "Then scan the QR code above.\n\n"
+        "No OTP is required."
+    )
+
+    deadline = time.monotonic() + QR_TIMEOUT
+
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+
+        result = await client.invoke(
+            raw.functions.auth.ExportLoginToken(
+                api_id=api_id,
+                api_hash=api_hash,
+                except_ids=[]
+            )
+        )
+
+        if isinstance(result, raw.types.auth.LoginTokenSuccess):
+            return True
+
+        if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+            await message.reply("**Telegram requested another DC for this login.**\nPlease run /login again.")
+            return False
+
+        if isinstance(result, raw.types.auth.LoginToken):
+            await send_qr(message, result.token, "**QR refreshed. Please scan this new QR.**")
+
+    await message.reply("**QR login timed out. Run /login again.**")
+    return False
+
 
 @Client.on_message(filters.private & ~filters.forwarded & filters.command(["logout"]))
 async def logout(client, message):
-    user_data = await db.get_session(message.from_user.id)  
-    if user_data is None:
-        return 
-    await db.set_session(message.from_user.id, session=None)  
+    if await db.get_session(message.from_user.id) is None:
+        return
+    await db.set_session(message.from_user.id, session=None)
     await message.reply("**Logout Successfully** ♦")
+
 
 @Client.on_message(filters.private & ~filters.forwarded & filters.command(["login"]))
 async def main(bot: Client, message: Message):
-    user_data = await db.get_session(message.from_user.id)
-    if user_data is not None:
-        await message.reply("**Your Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
-        return 
     user_id = int(message.from_user.id)
-    await message.reply("**How To Create Api Id And Api Hash.\n\nVideo Link :- https://youtu.be/LDtgwpI-N7M**")
-    api_id_msg = await bot.ask(user_id, "<b>Send Your API ID.\n\nClick On /skip To Skip This Process\n\nNOTE :- If You Skip This Then Your Account Ban Chance Is High.</b>", filters=filters.text)
-    if api_id_msg.text == "/skip":
+
+    if await db.get_session(user_id) is not None:
+        await message.reply("**You Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
+        return
+
+    await message.reply(
+        "**Telegram QR Login**\n\n"
+        "You will not need to send your phone number or OTP to this bot."
+    )
+
+    api_id_msg = await bot.ask(
+        user_id,
+        "<b>Send your Telegram API ID.\n\nUse /skip to use the bot's configured API credentials.</b>",
+        filters=filters.text,
+        timeout=300
+    )
+
+    if api_id_msg.text.strip() == "/skip":
         api_id = API_ID
         api_hash = API_HASH
     else:
         try:
-            api_id = int(api_id_msg.text)
+            api_id = int(api_id_msg.text.strip())
         except ValueError:
-            await api_id_msg.reply("**Api id must be an integer, start your process again by /login**", quote=True, reply_markup=InlineKeyboardMarkup(gen_button))
+            await api_id_msg.reply("**API ID must be an integer. Start again with /login.**")
             return
-        api_hash_msg = await bot.ask(user_id, "**Now Send Me Your API HASH**", filters=filters.text)
-        api_hash = api_hash_msg.text
-        
-    phone_number_msg = await bot.ask(chat_id=user_id, text="<b>Please send your phone number which includes country code</b>\n<b>Example:</b> <code>+13124562345, +9171828181889</code>")
-    if phone_number_msg.text=='/cancel':
-        return await phone_number_msg.reply('<b>process cancelled !</b>')
-    phone_number = phone_number_msg.text
-    client = Client(":memory:", api_id, api_hash)
-    await client.connect()
-    await phone_number_msg.reply("Sending OTP...")
+
+        api_hash_msg = await bot.ask(
+            user_id,
+            "**Now send your Telegram API Hash.**",
+            filters=filters.text,
+            timeout=300
+        )
+
+        if api_hash_msg.text.strip() == "/cancel":
+            await api_hash_msg.reply("**Login cancelled.**")
+            return
+
+        api_hash = api_hash_msg.text.strip()
+
+    client = Client(":memory:", api_id=api_id, api_hash=api_hash)
+
     try:
-        code = await client.send_code(phone_number)
-        phone_code_msg = await bot.ask(user_id, "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**", filters=filters.text, timeout=600)
-    except PhoneNumberInvalid:
-        await phone_number_msg.reply('`PHONE_NUMBER` **is invalid.**')
-        return
-    if phone_code_msg.text=='/cancel':
-        return await phone_code_msg.reply('<b>process cancelled !</b>')
-    try:
-        phone_code = phone_code_msg.text.replace(" ", "")
-        await client.sign_in(phone_number, code.phone_code_hash, phone_code)
-    except PhoneCodeInvalid:
-        await phone_code_msg.reply('**OTP is invalid.**')
-        return
-    except PhoneCodeExpired:
-        await phone_code_msg.reply('**OTP is expired.**')
-        return
-    except SessionPasswordNeeded:
-        two_step_msg = await bot.ask(user_id, '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**', filters=filters.text, timeout=300)
-        if two_step_msg.text=='/cancel':
-            return await two_step_msg.reply('<b>process cancelled !</b>')
+        await client.connect()
+
+        success = await qr_login(client, message, api_id, api_hash)
+        if not success:
+            await client.disconnect()
+            return
+
+        session_string = await client.export_session_string()
+        if not session_string:
+            raise RuntimeError("Telegram returned an empty session string.")
+
+        verify_client = Client(
+            ":memory:",
+            session_string=session_string,
+            api_id=api_id,
+            api_hash=api_hash
+        )
+
+        await verify_client.start()
+        me = await verify_client.get_me()
+
+        if not me:
+            await verify_client.stop()
+            raise RuntimeError("Telegram session verification failed.")
+
+        await db.set_session(user_id, session=session_string)
+        await db.set_api_id(user_id, api_id=api_id)
+        await db.set_api_hash(user_id, api_hash=api_hash)
+
+        await verify_client.stop()
+        await client.disconnect()
+
+        await bot.send_message(
+            user_id,
+            "**Account Login Successfully.**\n\nYour Telegram session has been saved."
+        )
+
+    except RPCError as e:
         try:
-            password = two_step_msg.text
-            await client.check_password(password=password)
-        except PasswordHashInvalid:
-            await two_step_msg.reply('**Invalid Password Provided**')
-            return
-    string_session = await client.export_session_string()
-    await client.disconnect()
-    if len(string_session) < SESSION_STRING_SIZE:
-        return await message.reply('<b>invalid session sring</b>')
-    try:
-        user_data = await db.get_session(message.from_user.id)
-        if user_data is None:
-            uclient = Client(":memory:", session_string=string_session, api_id=api_id, api_hash=api_hash)
-            await uclient.connect()
-            await db.set_session(message.from_user.id, session=string_session)
-            await db.set_api_id(message.from_user.id, api_id=api_id)
-            await db.set_api_hash(message.from_user.id, api_hash=api_hash)
-            try:
-                await uclient.disconnect()
-            except:
-                pass
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.reply_text(f"**Telegram login failed:**\n\n{e}")
+
     except Exception as e:
-        return await message.reply_text(f"<b>ERROR IN LOGIN:</b> `{e}`")
-    await bot.send_message(message.from_user.id, "<b>Account Login Successfully.\n\nIf You Get Any Error Related To AUTH KEY Then /logout first and /login again</b>")
-
-
-# Don't Remove Credit Tg - @VJ_Bots
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.reply_text(f"**ERROR IN LOGIN:**\n\n{e}")
